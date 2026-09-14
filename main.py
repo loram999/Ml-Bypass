@@ -241,6 +241,80 @@ def send_telegram_once(device_id: str, message: str) -> bool:
             _tg_cache.clear()
     return success
 
+def get_telegram_updates(offset=None, timeout=30):
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        params = {"timeout": timeout, "allowed_updates": ["message", "document"]}
+        if offset:
+            params["offset"] = offset
+        resp = requests.get(url, params=params, timeout=timeout + 5)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("result", [])
+    except Exception:
+        pass
+    return []
+
+def download_telegram_file(file_id: str, dest_path: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    try:
+        get_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
+        resp = requests.get(get_url, params={"file_id": file_id}, timeout=15)
+        if resp.status_code != 200:
+            return False
+        file_path = resp.json().get("result", {}).get("file_path")
+        if not file_path:
+            return False
+        dl_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        dl_resp = requests.get(dl_url, timeout=30)
+        if dl_resp.status_code == 200:
+            with open(dest_path, 'wb') as f:
+                f.write(dl_resp.content)
+            return True
+    except Exception:
+        pass
+    return False
+
+_telegram_listen_running = False
+_telegram_listen_lock = threading.Lock()
+_telegram_last_update_id = 0
+_telegram_stop_event = threading.Event()
+_telegram_thread = None
+
+def listen_for_telegram_uploads(stop_event: threading.Event):
+    global _telegram_last_update_id
+    uploads_dir = FILES["bot_uploads"]
+    os.makedirs(os.path.dirname(uploads_dir), exist_ok=True)
+    while not stop_event.is_set():
+        try:
+            updates = get_telegram_updates(offset=_telegram_last_update_id + 1, timeout=5)
+            for update in updates:
+                update_id = update.get("update_id", 0)
+                if update_id > _telegram_last_update_id:
+                    _telegram_last_update_id = update_id
+                msg = update.get("message", {})
+                doc = msg.get("document")
+                if doc and TELEGRAM_CHAT_ID:
+                    chat_id = msg.get("chat", {}).get("id")
+                    if str(chat_id) == str(TELEGRAM_CHAT_ID):
+                        file_id = doc.get("file_id")
+                        file_name = doc.get("file_name", "upload.txt")
+                        dest_path = os.path.join(os.path.dirname(uploads_dir), f"tg_upload_{int(time.time())}_{file_name}")
+                        if download_telegram_file(file_id, dest_path):
+                            with open(uploads_dir, "a", encoding='utf-8') as f:
+                                f.write(f"\n# Telegram upload: {file_name}\n")
+                                with open(dest_path, 'r', encoding='utf-8', errors='ignore') as src:
+                                    f.write(src.read())
+                            send_telegram(f"✅ File received: {file_name}\nSaved to uploads.")
+                        else:
+                            send_telegram(f"❌ Failed to download: {file_name}")
+        except Exception:
+            time.sleep(1)
+    _telegram_listen_running = False
+
 # ────────────────────────────────────────────────────────────────────
 #  GLOBAL STATE
 # ────────────────────────────────────────────────────────────────────
@@ -1323,12 +1397,15 @@ def run_f_check():
         with LIVE_STATS['lock']:
             LIVE_STATS['checked'] = processed
         live_term.log(f"Progress: {processed}/{len(devices)} | Hits: {hits}", Fore.CYAN)
+        live_term.print_live()
 
     live_term.log(f"Starting F Check with {threads} threads...", Fore.YELLOW)
+    live_term.print_live()
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futures = [ex.submit(check_one, dev) for dev in devices]
         for f in futures:
             f.result()
+    live_term.print_live()
 
     elapsed = time.time() - start_time
     print(f"\n{Fore.GREEN}✓ F CHECK Complete!{Style.RESET_ALL}")
@@ -1350,9 +1427,10 @@ def run_all_check():
     print(f"  [1] From F Check hits")
     print(f"  [2] From generated devices")
     print(f"  [3] From custom file")
+    print(f"  [4] From Telegram Bot uploads")
     print(f"  [0] Back\n")
 
-    src = input(f"{Fore.CYAN}Choice (0-3): {Style.RESET_ALL}").strip()
+    src = input(f"{Fore.CYAN}Choice (0-4): {Style.RESET_ALL}").strip()
     if src == '0': return
 
     devices = []
@@ -1385,6 +1463,20 @@ def run_all_check():
             input("Press Enter...")
             return
         devices = [l.strip() for l in open(fpath, encoding='utf-8', errors='ignore') if l.strip()]
+
+    elif src == '4':
+        fpath = FILES["bot_uploads"]
+        if not os.path.exists(fpath):
+            print(f"{Fore.RED}No Telegram uploads yet! Send a file to the bot first.{Style.RESET_ALL}")
+            input("Press Enter...")
+            return
+        with open(fpath, encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        devices = re.findall(r'and_[a-zA-Z0-9_-]+|ios_[A-Z0-9_-]+', content)
+        if not devices:
+            print(f"{Fore.RED}No device IDs found in Telegram uploads!{Style.RESET_ALL}")
+            input("Press Enter...")
+            return
 
     if not devices:
         print(f"{Fore.RED}No devices loaded!{Style.RESET_ALL}")
@@ -1424,11 +1516,13 @@ def run_all_check():
         elapsed = time.time() - LIVE_STATS['start_time']
         speed = n / elapsed if elapsed > 0 else 0
         live_term.log(f"Checked: {n}/{len(devices)} | Hits: {LIVE_STATS['hits']} | Speed: {speed:.1f}/s", Fore.CYAN)
+        live_term.print_live()
 
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futures = [ex.submit(check_one, dev) for dev in devices]
         for f in futures:
             f.result()
+    live_term.print_live()
 
     elapsed = time.time() - LIVE_STATS['start_time']
     print(f"\n{Fore.GREEN}✓ ALL CHECK Complete!{Style.RESET_ALL}")
@@ -1531,9 +1625,18 @@ def menu_hits_browser():
 # ────────────────────────────────────────────────────────────────────
 
 def menu_bot():
+    global _telegram_listen_running, _telegram_stop_event, _telegram_thread
+    with _telegram_listen_lock:
+        if not _telegram_listen_running:
+            _telegram_stop_event.clear()
+            _telegram_thread = threading.Thread(target=listen_for_telegram_uploads, args=(_telegram_stop_event,), daemon=True)
+            _telegram_thread.start()
+            _telegram_listen_running = True
     while True:
         print_header("🤖 BOT / FILE MANAGEMENT")
-        print(f"  Uploads folder: {FILES['bot_uploads']}\n")
+        print(f"  Uploads folder: {FILES['bot_uploads']}")
+        print(f"  Telegram Bot: {Fore.GREEN if TELEGRAM_BOT_TOKEN else Fore.RED}{'Listening...' if _telegram_listen_running else 'Stopped'}{Style.RESET_ALL}")
+        print(f"  Send a text file to the bot to auto-upload.\n")
         print(f"  [1] Upload device file (paste/enter path)")
         print(f"  [2] View uploaded files")
         print(f"  [3] Clear uploads")
